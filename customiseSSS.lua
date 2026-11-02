@@ -330,20 +330,48 @@ local function applyFace(model, item)
 	decal.Parent = head
 end
 
+local function nearestPartOwns(appearance, part)
+	local parent = appearance.Parent
+	while parent and parent ~= part do
+		if parent:IsA("BasePart") then
+			return false
+		end
+		parent = parent.Parent
+	end
+	return parent == part
+end
+
+local function tintPart(part, color)
+	local painted = false
+	for _, child in ipairs(part:GetDescendants()) do
+		if child:IsA("SurfaceAppearance") and nearestPartOwns(child, part) then
+			pcall(function()
+				child.Color = color
+			end)
+			painted = true
+		end
+	end
+	if painted then
+		return
+	end
+	part.Color = color
+	local mesh = part:FindFirstChildOfClass("SpecialMesh")
+	if mesh then
+		mesh.VertexColor = Vector3.new(color.R, color.G, color.B)
+	end
+end
+
 local function tintHair(model, item)
 	if not item or type(item.brickColor) ~= "string" then
 		return
 	end
 	local color = BrickColor.new(item.brickColor).Color
 	for _, child in ipairs(model:GetChildren()) do
-		if child:GetAttribute("CustomiseSlot") == "hair" then
+		local slot = child:GetAttribute("CustomiseSlot")
+		if slot == "hair" or slot == "facialHair" then
 			for _, part in ipairs(child:GetDescendants()) do
 				if part:IsA("BasePart") and part.Name ~= "CustomiseGuide" then
-					part.Color = color
-					local mesh = part:FindFirstChildOfClass("SpecialMesh")
-					if mesh then
-						mesh.VertexColor = Vector3.new(color.R, color.G, color.B)
-					end
+					tintPart(part, color)
 				end
 			end
 		end
