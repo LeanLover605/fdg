@@ -698,27 +698,74 @@ local lastCreate = {}
 local lastCreateFlood = {}
 local lastJoin = {}
 
-local function rememberRank(player, rank, roleName)
-	rankCache[player.UserId] = {
+local function readNations()
+	local folder = ReplicatedStorage:FindFirstChild("Nation Module")
+	if folder == nil then
+		return nil
+	end
+	local list = {}
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("ModuleScript") then
+			local ok, result = pcall(require, child)
+			if ok and type(result) == "table" then
+				local groupId = result.GroupId
+				if type(groupId) ~= "number" or groupId ~= groupId then
+					groupId = 0
+				end
+				groupId = math.floor(groupId)
+				local bar = result.UnitPermissions
+				if type(bar) ~= "number" or bar ~= bar then
+					bar = 0
+				end
+				bar = math.floor(bar)
+				if bar < 0 then
+					bar = 0
+				end
+				local name = result.Name
+				if type(name) ~= "string" or name == "" then
+					name = child.Name
+				end
+				if groupId > 0 then
+					table.insert(list, {
+						name = name,
+						groupId = groupId,
+						unitPermissions = bar,
+					})
+				end
+			else
+				warn("[ServerBrowser] " .. child.Name .. " did not return a nation.")
+			end
+		end
+	end
+	return list
+end
+
+local function rememberRank(player, groupId, rank, roleName)
+	local bucket = rankCache[player.UserId]
+	if bucket == nil then
+		bucket = {}
+		rankCache[player.UserId] = bucket
+	end
+	bucket[groupId] = {
 		rank = rank,
 		role = roleName,
 		at = os.clock(),
 	}
 end
 
-local function lookupGroup(player)
-	local cached = rankCache[player.UserId]
+local function lookupGroup(player, groupId)
+	local bucket = rankCache[player.UserId]
+	local cached = bucket and bucket[groupId]
 	if cached and os.clock() - cached.at < 60 then
 		return cached.rank, cached.role
 	end
 
-	if Config.GroupId == 0 then
-		rememberRank(player, 0, "Guest")
+	if type(groupId) ~= "number" or groupId <= 0 then
 		return 0, "Guest"
 	end
 
 	local rolesOk, result = pcall(function()
-		return GroupService:GetRolesInGroupAsync(player.UserId, Config.GroupId)
+		return GroupService:GetRolesInGroupAsync(player.UserId, groupId)
 	end)
 	if rolesOk and type(result) == "table" and type(result.Roles) == "table" then
 		local bestRank = nil
@@ -738,15 +785,15 @@ local function lookupGroup(player)
 			bestRank = 0
 			bestName = "Guest"
 		end
-		rememberRank(player, bestRank, bestName)
+		rememberRank(player, groupId, bestRank, bestName)
 		return bestRank, bestName
 	end
 
 	local rankOk, rank = pcall(function()
-		return player:GetRankInGroupAsync(Config.GroupId)
+		return player:GetRankInGroupAsync(groupId)
 	end)
 	local roleOk, roleName = pcall(function()
-		return player:GetRoleInGroupAsync(Config.GroupId)
+		return player:GetRoleInGroupAsync(groupId)
 	end)
 	if not rankOk or type(rank) ~= "number" then
 		return nil, nil
@@ -754,29 +801,54 @@ local function lookupGroup(player)
 	if not roleOk or type(roleName) ~= "string" or roleName == "" then
 		roleName = "Guest"
 	end
-	rememberRank(player, rank, roleName)
+	rememberRank(player, groupId, rank, roleName)
 	return rank, roleName
 end
 
 local function hostDecision(player)
 	local inStudio = RunService:IsStudio()
 	if Listing.isAlwaysAllowed(player.UserId, Config.AlwaysAllowUserIds) then
-		return true, 0, ""
+		return true, 0, "", nil, ""
 	end
 	if inStudio and Config.BypassRankInStudio then
-		local rank, roleName = lookupGroup(player)
-		return true, rank or 0, roleName or ""
+		return true, 0, "", nil, ""
 	end
 
-	local rank, roleName = lookupGroup(player)
-	if rank == nil then
-		return false, 0, "Guest", "Could not check your group role. Try again."
+	local nations = readNations()
+	if nations == nil or #nations == 0 then
+		return false, 0, "Guest", Listing.missingNationsMessage(), ""
 	end
-	local allowed = Listing.canHost(rank, player.UserId, Config, false)
-	if allowed then
-		return true, rank, roleName
+	local checked = {}
+	local failed = false
+	for _, nation in ipairs(nations) do
+		local rank, roleName = lookupGroup(player, nation.groupId)
+		if rank == nil then
+			failed = true
+		else
+			table.insert(checked, {
+				name = nation.name,
+				groupId = nation.groupId,
+				unitPermissions = nation.unitPermissions,
+				rank = rank,
+				role = roleName or "Guest",
+			})
+		end
 	end
-	return false, rank, roleName, Listing.denialMessage(rank, roleName, Config)
+	local chosen = Listing.pickHost(checked)
+	if chosen then
+		return true, chosen.rank or 0, chosen.role or "", nil, chosen.name or ""
+	end
+	if failed and #checked == 0 then
+		return false, 0, "Guest", "Could not check your group role. Try again.", ""
+	end
+	local shown = checked[1]
+	local rank = 0
+	local roleName = "Guest"
+	if shown then
+		rank = shown.rank or 0
+		roleName = shown.role or "Guest"
+	end
+	return false, rank, roleName, Listing.hostDenial(checked), ""
 end
 
 local function cooldownReady(bucket, userId, seconds)
@@ -1051,13 +1123,14 @@ end
 
 getPermission.OnServerInvoke = function(player)
 	return guarded(player, function()
-		local allowed, rank, roleName, message = hostDecision(player)
+		local allowed, rank, roleName, message, nation = hostDecision(player)
 		return {
 			ok = true,
 			canHost = allowed,
 			rank = rank,
 			role = roleName,
 			message = message,
+			nation = nation,
 		}
 	end)
 end
@@ -1225,19 +1298,18 @@ Players.PlayerRemoving:Connect(function(player)
 	rankCache[player.UserId] = nil
 end)
 
-if Config.GroupId == 0 and not RunService:IsStudio() then
-	warn("[ServerBrowser] GroupId is 0, so nobody can create a server. Set it in ReplicatedStorage.ServerBrowser.Config.")
-end
-if RunService:IsStudio() and Config.BypassRankInStudio then
-	warn("[ServerBrowser] Studio is skipping the group rank check. Set BypassRankInStudio to false to test ranks.")
-end
-if usingMock then
-	print("[ServerBrowser] Studio practice list is on. No reserved server will be created from this session.")
-else
-	print(string.format(
-		"[ServerBrowser] Lobby ready. Group %d, minimum rank %d (%s).",
-		Config.GroupId,
-		Config.MinimumRank,
-		Config.MinimumRankName
-	))
+do
+	local nations = readNations()
+	local count = nations and #nations or 0
+	if count == 0 and not (RunService:IsStudio() and Config.BypassRankInStudio) then
+		warn("[ServerBrowser] ReplicatedStorage.Nation Module has no nation with a GroupId, so nobody can create a server.")
+	end
+	if RunService:IsStudio() and Config.BypassRankInStudio then
+		warn("[ServerBrowser] Studio is skipping the nation rank check. Set BypassRankInStudio to false to test ranks.")
+	end
+	if usingMock then
+		print("[ServerBrowser] Studio practice list is on. No reserved server will be created from this session.")
+	else
+		print("[ServerBrowser] Lobby ready. Nations that can host: " .. tostring(count) .. ".")
+	end
 end
