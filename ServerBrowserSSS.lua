@@ -94,6 +94,17 @@ end
 local Config = configOrErr
 local Listing = listingOrErr
 
+local AdminPerms = nil
+local adminModule = folder:FindFirstChild("AdminPerms")
+if adminModule and adminModule:IsA("ModuleScript") then
+	local loadedAdmin, adminOrErr = pcall(require, adminModule)
+	if loadedAdmin and type(adminOrErr) == "table" then
+		AdminPerms = adminOrErr
+	else
+		warn("[ServerBrowser] AdminPerms did not load. " .. tostring(adminOrErr))
+	end
+end
+
 local function isReservedServer()
 	return game.PrivateServerId ~= "" and game.PrivateServerOwnerId == 0
 end
@@ -805,6 +816,46 @@ local function lookupGroup(player, groupId)
 	return rank, roleName
 end
 
+local function passwordBypass(player)
+	if AdminPerms == nil or type(AdminPerms.Groups) ~= "table" or type(AdminPerms.qualifies) ~= "function" then
+		return false
+	end
+	local held = {}
+	for index = 1, #AdminPerms.Groups do
+		local entry = AdminPerms.Groups[index]
+		local groupId = 0
+		if type(entry) == "table" then
+			groupId = entry.GroupId
+			if type(groupId) ~= "number" then
+				groupId = entry.groupId
+			end
+		end
+		if type(groupId) == "number" and groupId == groupId and groupId > 0 then
+			local rank = lookupGroup(player, math.floor(groupId))
+			if type(rank) == "number" then
+				held[#held + 1] = { groupId = math.floor(groupId), rank = rank }
+			end
+		end
+	end
+	return AdminPerms.qualifies(AdminPerms.Groups, held) == true
+end
+
+local function passwordAccepted(stored, given, bypass)
+	if AdminPerms and type(AdminPerms.passwordOk) == "function" then
+		return AdminPerms.passwordOk(stored, given, bypass)
+	end
+	if bypass == true then
+		return true
+	end
+	if type(given) ~= "string" then
+		given = ""
+	end
+	if type(stored) == "string" and stored ~= "" and stored ~= given then
+		return false
+	end
+	return true
+end
+
 local function hostDecision(player)
 	local inStudio = RunService:IsStudio()
 	if Listing.isAlwaysAllowed(player.UserId, Config.AlwaysAllowUserIds) then
@@ -1023,7 +1074,8 @@ local function claimAndTeleport(player, serverId, password)
 		invalidateCache()
 		return { ok = false, error = "That server no longer exists." }
 	end
-	if type(current.password) == "string" and current.password ~= "" and current.password ~= password then
+	local bypass = passwordBypass(player)
+	if not passwordAccepted(current.password, password, bypass) then
 		return { ok = false, error = "Wrong password." }
 	end
 
@@ -1032,7 +1084,7 @@ local function claimAndTeleport(player, serverId, password)
 			return nil
 		end
 		local nextValue = table.clone(old)
-		if type(nextValue.password) == "string" and nextValue.password ~= "" and nextValue.password ~= password then
+		if not passwordAccepted(nextValue.password, password, bypass) then
 			nextValue.joinResult = "password"
 			return nextValue
 		end
@@ -1127,6 +1179,7 @@ getPermission.OnServerInvoke = function(player)
 		return {
 			ok = true,
 			canHost = allowed,
+			bypassPassword = passwordBypass(player),
 			rank = rank,
 			role = roleName,
 			message = message,
@@ -1271,8 +1324,9 @@ quickPlay.OnServerInvoke = function(player)
 		end
 
 		local attempts = 0
+		local bypass = passwordBypass(player)
 		for _, info in ipairs(servers) do
-			if info.hasPassword ~= true and info.players < info.maxPlayers then
+			if (bypass or info.hasPassword ~= true) and info.players < info.maxPlayers then
 				attempts = attempts + 1
 				local result = claimAndTeleport(player, info.id, "")
 				if result.ok then
