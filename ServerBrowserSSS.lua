@@ -203,8 +203,35 @@ if usingMock then
 		end
 		return items
 	end
+
+	local hosts = {}
+
+	function backend.rememberHost(userId, serverId)
+		if serverId == nil or serverId == "" or userId == nil or userId == 0 or userId == "0" then
+			return false
+		end
+		hosts[tostring(userId)] = serverId
+		return true
+	end
+
+	function backend.forgetHost(userId)
+		if userId == nil then
+			return false
+		end
+		hosts[tostring(userId)] = nil
+		return true
+	end
+
+	function backend.hostServer(userId)
+		if userId == nil then
+			return nil
+		end
+		return hosts[tostring(userId)]
+	end
 else
 	local store = MemoryStoreService:GetHashMap(Config.HashMapName)
+	-- A host record is one read. Creating a server must not list every battle.
+	local hosts = MemoryStoreService:GetHashMap(Config.HashMapName .. "_hosts")
 
 	function backend.get(id)
 		local ok, value = pcall(function()
@@ -281,6 +308,48 @@ else
 			end
 		end
 		return items
+	end
+
+	function backend.rememberHost(userId, serverId)
+		if serverId == nil or serverId == "" or userId == nil or userId == 0 or userId == "0" then
+			return false
+		end
+		local ok, err = pcall(function()
+			hosts:SetAsync(tostring(userId), serverId, Config.ListingLifetime)
+		end)
+		if not ok then
+			return false, err
+		end
+		return true
+	end
+
+	function backend.forgetHost(userId)
+		if userId == nil or userId == 0 or userId == "0" then
+			return false
+		end
+		local ok, err = pcall(function()
+			hosts:RemoveAsync(tostring(userId))
+		end)
+		if not ok then
+			return false, err
+		end
+		return true
+	end
+
+	function backend.hostServer(userId)
+		if userId == nil then
+			return nil
+		end
+		local ok, value = pcall(function()
+			return hosts:GetAsync(tostring(userId))
+		end)
+		if not ok then
+			return nil, value
+		end
+		if type(value) ~= "string" or value == "" then
+			return nil
+		end
+		return value
 	end
 end
 
@@ -379,6 +448,7 @@ local function startBattleServer()
 	local function pushCount(count)
 		if count <= 0 then
 			backend.remove(serverId)
+			backend.forgetHost(matchData.hostUserId)
 			return
 		end
 		local saved, err = backend.update(serverId, function(old)
@@ -416,12 +486,17 @@ local function startBattleServer()
 	task.spawn(function()
 		while serverId do
 			task.wait(Config.HeartbeatSeconds)
-			pushCount(playerCount(nil))
+			local count = playerCount(nil)
+			pushCount(count)
+			if count > 0 then
+				backend.rememberHost(matchData.hostUserId, serverId)
+			end
 		end
 	end)
 
 	game:BindToClose(function()
 		backend.remove(serverId)
+		backend.forgetHost(matchData.hostUserId)
 	end)
 end
 
@@ -573,27 +648,94 @@ if isReservedServer() then
 	return
 end
 
-local cache = {
-	ok = false,
-	at = 0,
-	servers = {},
+local listState = {
+	items = nil,
+	freshUntil = 0,
+	retryAt = 0,
+	err = nil,
+	warned = false,
 }
+local listing = false
+local listGate = Instance.new("BindableEvent")
 
 local function invalidateCache()
-	cache.at = 0
+	listState.freshUntil = 0
+end
+
+local function dropStale(items)
+	local now = os.time()
+	local dropped = 0
+	for _, item in ipairs(items) do
+		if dropped >= 2 then
+			break
+		end
+		local value = item.value
+		if type(value) == "table" and value.version == 1 and type(item.key) == "string" and not Listing.isListable(value, now, Config.StaleAfterSeconds) then
+			dropped = dropped + 1
+			local key = item.key
+			task.spawn(function()
+				backend.remove(key)
+			end)
+		end
+	end
+end
+
+local function rawItems()
+	local now = os.clock()
+	if listState.items and now < listState.freshUntil then
+		return listState.items
+	end
+	if now < listState.retryAt then
+		if listState.items then
+			return listState.items
+		end
+		return nil, listState.err
+	end
+	if listing then
+		listGate.Event:Wait()
+		if listState.items then
+			return listState.items
+		end
+		return nil, listState.err
+	end
+
+	listing = true
+	local items, err = backend.list()
+	local clock = os.clock()
+	if not items then
+		local waitFor = Config.ListRetrySeconds
+		if type(waitFor) ~= "number" or waitFor < 1 then
+			waitFor = 30
+		end
+		listState.retryAt = clock + waitFor
+		listState.err = err
+		if not listState.warned then
+			listState.warned = true
+			if listState.items then
+				warn("[ServerBrowser] Using the previous server list.", err)
+			else
+				warn("[ServerBrowser] Could not read the server list.", err)
+			end
+		end
+	else
+		listState.items = items
+		listState.freshUntil = clock + Config.ListCacheSeconds
+		listState.retryAt = 0
+		listState.err = nil
+		listState.warned = false
+		dropStale(items)
+	end
+	listing = false
+	listGate:Fire()
+	if listState.items and (items or clock < listState.retryAt) then
+		return listState.items
+	end
+	return nil, err
 end
 
 local function publicServers()
-	if cache.ok and os.clock() - cache.at < Config.ListCacheSeconds then
-		return cache.servers
-	end
-
-	local items, err = backend.list()
+	local items, err = rawItems()
 	if not items then
-		if cache.ok then
-			warn("[ServerBrowser] Using the previous server list.", err)
-			return cache.servers
-		end
 		return nil, err
 	end
 
@@ -603,34 +745,20 @@ local function publicServers()
 	for _, item in ipairs(items) do
 		local value = item.value
 		-- ListItemsAsync can return the same key twice while a page is read.
-		if type(value) == "table" and not seen[value.id] then
+		if type(value) == "table" and type(value.id) == "string" and not seen[value.id] then
 			if Listing.isListable(value, now, Config.StaleAfterSeconds) then
 				seen[value.id] = true
 				table.insert(rows, safeRow(value))
-			elseif value.version == 1 and type(item.key) == "string" then
-				local key = item.key
-				task.spawn(function()
-					backend.remove(key)
-				end)
 			end
 		end
 	end
 
 	Listing.sortForDisplay(rows)
 	Listing.capList(rows, Config.MaxListedServers)
-	cache = {
-		ok = true,
-		at = os.clock(),
-		servers = rows,
-	}
 	return rows
 end
 
-local function hostedCount(userId)
-	local items, err = backend.list()
-	if not items then
-		return nil, err
-	end
+local function countHosted(items, userId)
 	local now = os.time()
 	local count = 0
 	for _, item in ipairs(items) do
@@ -640,6 +768,33 @@ local function hostedCount(userId)
 		end
 	end
 	return count
+end
+
+local function hostedCount(userId)
+	local serverId, err = backend.hostServer(userId)
+	if err and serverId == nil then
+		if listState.items then
+			return countHosted(listState.items, userId)
+		end
+		return nil, err
+	end
+	if type(serverId) == "string" and serverId ~= "" then
+		local entry, readErr = backend.get(serverId)
+		if type(entry) == "table" and Listing.isListable(entry, os.time(), Config.StaleAfterSeconds) and entry.hostUserId == userId then
+			return 1
+		end
+		if readErr and entry == nil then
+			if listState.items then
+				return countHosted(listState.items, userId)
+			end
+			return nil, readErr
+		end
+		backend.forgetHost(userId)
+	end
+	if listState.items then
+		return countHosted(listState.items, userId)
+	end
+	return 0
 end
 
 local function newEntry(fields)
@@ -1277,11 +1432,13 @@ createServer.OnServerInvoke = function(player, payload)
 			warn("[ServerBrowser] Could not store the server:", saveErr)
 			return { ok = false, error = "Could not save the server. Try again." }
 		end
+		backend.rememberHost(player.UserId, serverId)
 
 		invalidateCache()
 		local teleported, mocked = teleportToBattle(player, entry)
 		if not teleported then
 			backend.remove(serverId)
+			backend.forgetHost(player.UserId)
 			invalidateCache()
 			return {
 				ok = false,
